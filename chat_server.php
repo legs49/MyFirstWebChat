@@ -1,8 +1,15 @@
 <?php
 	$count = 1;
+	$pos = 0;
+	$customers_waiting = 0;
 	$host = 'localhost'; //host
 	$port = '5051'; //port
 	$null = NULL; //null var
+	$manager_connected = false;
+	$managers = 0;
+	$current_chat_customer = 0;
+	$chat_in_progress = false;
+	
 	//Create TCP/IP sream socket
 	$socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
 	//reuseable port
@@ -13,6 +20,8 @@
 	socket_listen($socket);
 	//create & add listning socket to the list
 	$clients = array($socket);
+	$customers = array(); //
+
 	//start endless loop, so that our script doesn't stop
 	debugToBrowserConsole ("Listening Sockets created");
 
@@ -32,7 +41,7 @@
 		//check for new socket
 		if (in_array($socket, $changed)) 
 		{
-			debugToBrowserConsole ("Waiting for Connections");			
+			debugToBrowserConsole ("Accepting Connection");			
 			$socket_new = socket_accept($socket); //accpet new socket
 			$clients[] = $socket_new; //add socket to client array
 			
@@ -40,9 +49,23 @@
 			perform_handshaking($header, $socket_new, $host, $port); //perform websocket handshake
 			
 			socket_getpeername($socket_new, $ip); //get ip address of connected socket
-			$response = mask(json_encode(array('type'=>'system', 'message'=>$ip.' connected'))); //prepare json data
-			send_message($response); //notify all users about new connection
-			
+			//Assume all connections are customers until the first message which identifies the connection
+			// as the manager connection, at which point it will be removed from the array.
+			$customers[] = $socket_new; 
+			$response = mask(json_encode(array('type'=>'system', 'message'=>$ip.' Waiting for Agent'))); //prepare json data
+			send_message_customer($response,$socket_new); //notify this client only about new connection
+	
+			$pos = customers_position_in_queue($socket_new);
+			$response_text = mask(json_encode(array('type'=>'system', 'message'=>'You are number '.$pos.' in the queue'))); //prepare json data
+			send_message_customer($response_text,$socket_new); //send data
+
+			if ($manager_connected)
+			{
+				$customers_waiting = customers_waiting();	
+				$response = mask(json_encode(array('type'=>'system', 'message'=>$ip.' connected. '.$customers_waiting.' waiting'))); //prepare json data
+				send_message_manager($response);
+			}
+
 			//make room for new socket
 			$found_socket = array_search($socket, $changed);
 			unset($changed[$found_socket]);
@@ -56,16 +79,73 @@
 			while(socket_recv($changed_socket, $buf, 1024, 0) >= 1)
 			{
 				$received_text = unmask($buf); //unmask data
-				$tst_msg = json_decode($received_text); //json decode 
-				$user_name = $tst_msg->name; //sender name
-				$user_message = $tst_msg->message; //message text
-				$user_color = $tst_msg->color; //color
-				
-				//prepare data to be sent to client
-				$response_text = mask(json_encode(array('type'=>'usermsg', 'name'=>$user_name, 'message'=>$user_message, 'color'=>$user_color)));
-				send_message($response_text); //send data
-				break 2; //exist this loop
-			}
+				$tst_msg = json_decode($received_text); //json decode
+				if ($tst_msg != null)
+				{
+					$user_name = $tst_msg->name; //sender name
+					$user_message = $tst_msg->message; //message text
+					$user_manager = $tst_msg->manager; // message manager flag
+					$user_color = $tst_msg->color; //color
+					
+					if ($user_manager)
+					{
+						// Establish a single manager, one pass only, reset when manager disconnects.
+						if (!$manager_connected)
+						{
+							$found_socket = array_search($changed_socket, $customers);
+							unset($customers[$found_socket]);
+							//debugToBrowserConsole('Manager accepted next connection');
+							$manager_connected = true;
+							$managers = $changed_socket;
+							$customers_waiting = customers_waiting();	
+							$response = mask(json_encode(array('type'=>'system', 'message'=>'On initial connection '.$customers_waiting.' waiting'))); //prepare json data
+							send_message_manager($response);
+						}
+						if (!$chat_in_progress)
+						{
+							$customers_waiting = customers_connected();	
+							// Talk to first in queue
+							if ($customers_waiting > 0)
+							{
+								$current_chat_customer = customers_connected_first();
+								$chat_in_progress = true;
+								$response = mask(json_encode(array('type'=>'system', 'message'=>' Now talking to an Agent.'))); //prepare json data
+								send_message_customer($response, $current_chat_customer);
+								send_position_in_queue_to_all();
+								$response = mask(json_encode(array('type'=>'system', 'message'=>'-------------------------------------------'))); //prepare json data
+								send_message_manager($response);
+								$customers_waiting = customers_waiting();	
+								$response = mask(json_encode(array('type'=>'system', 'message'=>'Customer Chat started. '
+																								.$customers_waiting.' still waiting'))); //prepare json data
+								send_message_manager($response);
+							}
+						}
+					}
+					else
+					{
+					}	// if ($user_manager)
+						
+					//prepare data to be sent to client
+					if ($chat_in_progress)
+					{
+						if ($changed_socket == $current_chat_customer or $changed_socket == $managers)
+						{
+							$response_text = mask(json_encode(array('type'=>'usermsg', 'name'=>$user_name, 'message'=>$user_message,
+																	'manager'=>$user_manager, 'color'=>$user_color)));
+							send_message_customer($response_text,$current_chat_customer); //send data
+							send_message_manager($response_text); //copy reply to manager
+						}
+						else
+						{
+							$pos = customers_position_in_queue($changed_socket);
+							$response_text = mask(json_encode(array('type'=>'system', 'message'=>'Sorry still waiting for an Agent. '.
+												  'You are number '.$pos.' in the queue'))); //prepare json data
+							send_message_customer($response_text,$changed_socket); //send data
+						}
+					}
+					break 2; //exit this loop
+				}  // if ($tst_msg != null)
+			}  // while(socket_recv
 			
 			$buf = @socket_read($changed_socket, 1024, PHP_NORMAL_READ);
 			if ($buf === false) 
@@ -75,24 +155,130 @@
 				socket_getpeername($changed_socket, $ip);
 				unset($clients[$found_socket]);
 				
-				//notify all users about disconnected connection
-				$response = mask(json_encode(array('type'=>'system', 'message'=>$ip.' disconnected')));
-				send_message($response);
-			}
-		}
+				if ($changed_socket == $managers)
+				{
+					$response = mask(json_encode(array('type'=>'system', 'message'=>'Waiting for Agent'))); //prepare json data
+					$manager_connected = false;
+					debugToBrowserConsole('Manager disconnect');					
+					$chat_in_progress = false;
+					$managers=null;
+					send_message_all ($response);
+					send_position_in_queue_to_all();
+				}
+				else
+				{
+					$found_socket = array_search($changed_socket, $customers);
+					unset($customers[$found_socket]);
+					if ($changed_socket == $current_chat_customer)
+					{
+						$chat_in_progress = false;
+						$current_chat_customer = null;
+					}
+					$customers_waiting = customers_waiting();	
+					$response = mask(json_encode(array('type'=>'system', 'message'=>$ip.' disconnected. '.$customers_waiting.' waiting'))); //prepare json data
+					send_message_manager($response);
+				}
+			}  //if ($buf === false)
+		} // foreach ($changed as $changed_socket) 
 	}
 	// close the listening socket
 	socket_close($sock);
 
-	function send_message($msg)
+	function customers_connected()
 	{
-		global $clients;
-		foreach($clients as $changed_socket)
+		$n = 0;
+		global $customers;
+		
+		foreach ($customers as $soc)
 		{
-			@socket_write($changed_socket,$msg,strlen($msg));
+			$n++;
+		}	
+		return $n;	
+	}
+	function customers_waiting()
+	{
+		global $chat_in_progress;
+
+		$n = customers_connected();
+
+		if ($chat_in_progress) 
+		{
+			$n--;
+		}
+
+		return $n;	
+	}
+
+	function customers_connected_first()
+	{
+		global $customers;
+		foreach ($customers as $soc)
+		{
+			break;
+		}	
+		return $soc;	
+	}
+	function customers_position_in_queue($cus)
+	{
+		global $customers;
+		global $chat_in_progress;
+		$n = 0;
+
+		foreach ($customers as $soc)
+		{
+			$n++;
+			if ($soc == $cus)
+			{
+				break;
+			}
+		}
+		if ($chat_in_progress)
+		{
+			$n--;
+		}		
+		return $n;	
+	}
+	function send_message_all($msg)
+	{
+		global $customers;
+		foreach($customers as $cus)
+		{
+			@socket_write($cus,$msg,strlen($msg));
 		}
 		return true;
 	}
+	function send_message_customer($msg, $this_client)
+	{
+		@socket_write($this_client,$msg,strlen($msg));
+		return true;
+	}
+	function send_message_manager($msg)
+	{
+		global $managers;
+		global $manager_connected;
+		if ($manager_connected)
+		{	
+			@socket_write($managers,$msg,strlen($msg));
+		}
+		return true;
+	}
+	function send_position_in_queue_to_all()
+	{
+		global $customers;
+		global $current_chat_customer;
+		$n = 0;
+
+		foreach ($customers as $cus)
+		{
+			if ($cus != $current_chat_customer)
+			{
+				$n++;
+				$response_text = mask(json_encode(array('type'=>'system', 'message'=>'You are now number '.$n.' in the queue'))); //prepare json data
+				send_message_customer($response_text,$cus); //send data
+			}
+		}
+	}
+
 	//Unmask incoming framed message
 	function unmask($text) {
 		$length = ord($text[1]) & 127;

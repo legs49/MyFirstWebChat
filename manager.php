@@ -66,7 +66,7 @@ $user_colour = array_rand($colours);
 			var msg = {
 			message: mymessage,
 			name: myname,
-			manager: false,
+			manager: true,
 			color : '<?php echo $colours[$user_colour]; ?>'
 			};
 			//convert and send data to server
